@@ -1,196 +1,91 @@
-import queue, threading, time, numpy as np
-import cv2, mediapipe as mp
+import queue, threading, time, numpy as np, cv2, mediapipe as mp
 import soundfile as sf, sounddevice as sd
 from scipy.signal import resample_poly
 
-CALIB_SECS = 2.0
-BLOCK = 2048
-SMOOTH_ALPHA = 0.25
-MAX_SHIFT_ST = 6
-VOL_FLOOR = 0.05
-COOLDOWN_S = 0.5
-OPEN_SPREAD = 40
+CALIB_SECS, BLOCK = 2.0, 2048
+ALPHA, MAX_ST, VOL_MIN = 0.25, 6, 0.05
+COOLDOWN, OPEN_PX = 0.5, 40
 
-pitch_q = queue.Queue(maxsize=1)
-volume_q = queue.Queue(maxsize=1)
+pitch_q = queue.Queue(1)
+vol_q   = queue.Queue(1)
 
-def thumb_index_dist(lm, w, h):
-    p1 = np.array([lm[4].x * w, lm[4].y * h])
-    p2 = np.array([lm[8].x * w, lm[8].y * h])
-    return np.linalg.norm(p1 - p2)
+def tdist(lm,w,h):
+    return np.linalg.norm([lm[4].x*w-lm[8].x*w, lm[4].y*h-lm[8].y*h])
 
-def fingers_up_count(lm):
-    tips = [4, 8, 12, 16, 20]
-    mcp = [2, 5, 9, 13, 17]
-    return sum(lm[t].y < lm[b].y for t, b in zip(tips, mcp))
+def fcount(lm):
+    return sum(lm[t].y < lm[b].y for t,b in zip([4,8,12,16,20],[2,5,9,13,17]))
 
-def fast_pitch_shift(block, st):
-    if st == 0:
-        return block
-    ratio = 2 ** (st / 12)
-    if ratio >= 1:
-        out = resample_poly(block, int(round(ratio * 100)), 100)
-    else:
-        out = resample_poly(block, 100, int(round(100 / ratio)))
-    if len(out) > len(block):
-        out = out[: len(block)]
-    elif len(out) < len(block):
-        out = np.pad(out, (0, len(block) - len(out)))
-    return out
+def rshift(block, st):
+    if st == 0: return block
+    r = 2**(st/12)
+    up,down = (int(round(r*100)),100) if r>=1 else (100,int(round(100/r)))
+    out = resample_poly(block, up, down)
+    return out[:len(block)] if len(out)>=len(block) else np.pad(out,(0,len(block)-len(out)))
 
-def video_loop():
-    hands = mp.solutions.hands.Hands(max_num_hands=1, min_detection_confidence=0.7)
-    cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
-
-    t0 = time.time()
-    d_min, d_max = np.inf, 0
-    pitch_s = 0.0
-    vol_s = 1.0
-    mode = "pitch"
-    armed = False
-    last_toggle = 0.0
-
+def video():
+    hsys = mp.solutions.hands.Hands(max_num_hands=1,min_detection_confidence=0.7)
+    cam  = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+    t0 = time.time(); dmin,dmax = np.inf,0
+    ps,vs = 0.,1.; mode="pitch"; armed=False; last=0.
     while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        frame = cv2.flip(frame, 1)
-        res = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
+        ok,f = cam.read(); f=cv2.flip(f,1)
+        if not ok: break
+        res = hsys.process(cv2.cvtColor(f,cv2.COLOR_BGR2RGB))
         if res.multi_hand_landmarks:
-            h, w, _ = frame.shape
-            lm = res.multi_hand_landmarks[0].landmark
-            spread = thumb_index_dist(lm, w, h)
-            f_up = fingers_up_count(lm)
-
-            now = time.time()
-            if f_up <= 1:
-                armed = True
-            elif (
-                f_up == 5
-                and spread > OPEN_SPREAD
-                and armed
-                and now - last_toggle > COOLDOWN_S
-            ):
-                mode = "volume" if mode == "pitch" else "pitch"
-                last_toggle = now
-                armed = False
-                pitch_s, vol_s = 0, 1
-
-            if now - t0 < CALIB_SECS:
-                d_min, d_max = min(d_min, spread), max(d_max, spread)
-                cv2.putText(
-                    frame,
-                    "Calibrating… pinch & spread",
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 0, 255),
-                    2,
-                )
-
-            rng = max(10.0, d_max - d_min)
-            norm = np.clip((spread - d_min) / rng, 0, 1)
-
-            if mode == "pitch":
-                raw = (0.5 - norm) * 2 * MAX_SHIFT_ST
-                pitch_s = (1 - SMOOTH_ALPHA) * pitch_s + SMOOTH_ALPHA * raw
-                pitch_val, vol_val = pitch_s, 1.0
+            H,W,_ = f.shape; lm=res.multi_hand_landmarks[0].landmark
+            d, up = tdist(lm,W,H), fcount(lm); now=time.time()
+            if up<=1: armed=True
+            elif up==5 and d>OPEN_PX and armed and now-last>COOLDOWN:
+                mode = "volume" if mode=="pitch" else "pitch"; last=now; armed=False; ps,vs=0,1
+            if now-t0<CALIB_SECS: dmin,dmax=min(dmin,d),max(dmax,d)
+            rng=max(10.,dmax-dmin); n=np.clip((d-dmin)/rng,0,1)
+            if mode=="pitch":
+                raw=(0.5-n)*2*MAX_ST
+                ps=(1-ALPHA)*ps+ALPHA*raw
+                pv,vv=ps,1.
             else:
-                raw = norm
-                vol_s = (1 - SMOOTH_ALPHA) * vol_s + SMOOTH_ALPHA * raw
-                pitch_val, vol_val = 0.0, max(VOL_FLOOR, vol_s)
+                raw=n
+                vs=(1-ALPHA)*vs+ALPHA*raw
+                pv,vv=0.,max(VOL_MIN,vs)
+            if pitch_q.full(): pitch_q.get_nowait()
+            pitch_q.put_nowait(pv)
+            if vol_q.full():   vol_q.get_nowait()
+            vol_q.put_nowait(vv)
+            a,b=(int(lm[4].x*W),int(lm[4].y*H)),(int(lm[8].x*W),int(lm[8].y*H))
+            cv2.line(f,a,b,(0,255,0),2)
+            cv2.putText(f,f"{pv:+.1f} st",(10,65),cv2.FONT_HERSHEY_SIMPLEX,0.9,(255,0,0),2)
+            cv2.putText(f,f"Vol {vv*100:3.0f}%",(10,95),cv2.FONT_HERSHEY_SIMPLEX,0.8,(0,255,255),2)
+            cv2.putText(f,f"[{mode.upper()}] high-five toggles",(10,25),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,0),2)
+            mp.solutions.drawing_utils.draw_landmarks(f,res.multi_hand_landmarks[0],mp.solutions.hands.HAND_CONNECTIONS)
+        cv2.imshow("Pitch / Volume",f)
+        if cv2.waitKey(1)&0xFF==27: break
+    cam.release(); cv2.destroyAllWindows()
 
-            for q, v in ((pitch_q, pitch_val), (volume_q, vol_val)):
-                if q.full():
-                    q.get_nowait()
-                q.put_nowait(v)
+W,S = sf.read("snippet.wav",dtype="float32")
+cursor=0; stop_evt = threading.Event()
 
-            p1 = np.array([lm[4].x * w, lm[4].y * h]).astype(int)
-            p2 = np.array([lm[8].x * w, lm[8].y * h]).astype(int)
-            cv2.line(frame, tuple(p1), tuple(p2), (0, 255, 0), 2)
-            cv2.putText(
-                frame,
-                f"{pitch_val:+.1f} st",
-                (10, 65),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.9,
-                (255, 0, 0),
-                2,
-            )
-            cv2.putText(
-                frame,
-                f"Vol {vol_val*100:3.0f}%",
-                (10, 95),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 255),
-                2,
-            )
-            cv2.putText(
-                frame,
-                f"[{mode.upper()} MODE]  (high-five toggles)",
-                (10, 25),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 0),
-                2,
-            )
-            mp.solutions.drawing_utils.draw_landmarks(
-                frame,
-                res.multi_hand_landmarks[0],
-                mp.solutions.hands.HAND_CONNECTIONS,
-            )
-
-        cv2.imshow("Gesture Pitch / Volume", frame)
-        if cv2.waitKey(1) & 0xFF == 27:
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-WAV, SR = sf.read("snippet.wav", dtype="float32")
-cursor = 0
-stop_evt = threading.Event()
-
-def audio_worker():
-    global cursor
-    pitch_v, vol_v = 0.0, 1.0
-
-    def cb(out, frames, *_):
-        nonlocal pitch_v, vol_v
-        global cursor
-
-        chunk = WAV[cursor : cursor + frames]
-        if len(chunk) < frames:
-            chunk = np.concatenate([chunk, WAV[: frames - len(chunk)]])
-            cursor = (cursor + frames) % len(WAV)
+def audio():
+    global cursor; pv,vv = 0.,1.
+    def cb(out,frames,*_):
+        nonlocal pv,vv; global cursor
+        seg = W[cursor:cursor+frames]
+        if len(seg)<frames:
+            seg = np.concatenate([seg, W[:frames-len(seg)]])
+            cursor = (cursor+frames)%len(W)
         else:
             cursor += frames
+        try: pv = pitch_q.get_nowait()
+        except queue.Empty: pass
+        try: vv = vol_q.get_nowait()
+        except queue.Empty: pass
+        mono = seg.mean(axis=1) if seg.ndim==2 else seg
+        out[:,0] = np.clip(rshift(mono,pv)*vv, -0.95, 0.95)
+    stream = sd.OutputStream(channels=1,samplerate=S,blocksize=BLOCK,callback=cb)
+    stream.start()
+    while not stop_evt.is_set(): time.sleep(0.05)
+    stream.stop(); stream.close()
 
-        try:
-            pitch_v = pitch_q.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            vol_v = volume_q.get_nowait()
-        except queue.Empty:
-            pass
-
-        mono = chunk.mean(axis=1) if chunk.ndim == 2 else chunk
-        shifted = fast_pitch_shift(mono, pitch_v)
-        out[:, 0] = np.clip(shifted * vol_v, -0.95, 0.95)
-
-    sd.OutputStream(
-        channels=1, samplerate=SR, blocksize=BLOCK, callback=cb
-    ).__enter__()
-    while not stop_evt.is_set():
-        time.sleep(0.05)
-
-if __name__ == "__main__":
-    threading.Thread(target=audio_worker, daemon=True).start()
-    try:
-        video_loop()
-    finally:
-        stop_evt.set()
-        time.sleep(0.2)
+if __name__=="__main__":
+    threading.Thread(target=audio,daemon=True).start()
+    try: video()
+    finally: stop_evt.set(); time.sleep(0.2)
