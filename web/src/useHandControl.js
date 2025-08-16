@@ -39,8 +39,7 @@ export async function startHandControl(videoEl, onUpdate) {
     const ALPHA = 0.25;
 
     let t0 = performance.now();
-    let dMin = Infinity,
-        dMax = 0;
+    let dMin = Infinity, dMax = 0;
     let pitchSm = 0;
 
     let rafId = 0;
@@ -53,8 +52,7 @@ export async function startHandControl(videoEl, onUpdate) {
 
         overlay.width = videoEl.videoWidth;
         overlay.height = videoEl.videoHeight;
-        const W = overlay.width,
-            H = overlay.height;
+        const W = overlay.width, H = overlay.height;
 
         ctx.clearRect(0, 0, W, H);
         ctx.drawImage(videoEl, 0, 0, W, H);
@@ -110,9 +108,7 @@ export async function startHandControl(videoEl, onUpdate) {
 
     return () => {
         cancelAnimationFrame(rafId);
-        try {
-            hand.close();
-        } catch { }
+        try { hand.close(); } catch { }
         stream.getTracks().forEach((t) => t.stop());
         if (overlay && overlay.parentElement) overlay.parentElement.removeChild(overlay);
     };

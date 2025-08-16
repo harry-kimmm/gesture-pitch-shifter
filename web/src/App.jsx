@@ -13,11 +13,13 @@ export default function App() {
     convolver: null,
     dest: null,
     rec: null,
+    monitor: null,
   });
 
   const [ready, setReady] = useState(false);
   const [recURL, setRecURL] = useState(null);
   const [status, setStatus] = useState("load an audio file");
+  const [muted, setMuted] = useState(false);
 
   async function handleFile(e) {
     if (!e.target.files.length) return;
@@ -30,31 +32,39 @@ export default function App() {
     src.buffer = buf;
     src.loop = true;
 
-    const gain = ctx.createGain(); gain.gain.value = 1;
+    const gain = ctx.createGain();
+    gain.gain.value = 1;
 
     const convolver = ctx.createConvolver();
     convolver.normalize = true;
+
     const wet = ctx.createGain(); wet.gain.value = 0.0;
     const dry = ctx.createGain(); dry.gain.value = 1.0;
 
     const dest = ctx.createMediaStreamDestination();
 
+    const monitor = ctx.createGain();
+    monitor.gain.value = 1.0;
+
     src.connect(gain);
+
     gain.connect(dry);
-    dry.connect(ctx.destination);
+    dry.connect(monitor);
     dry.connect(dest);
 
     gain.connect(wet);
     wet.connect(convolver);
-    convolver.connect(ctx.destination);
+    convolver.connect(monitor);
     convolver.connect(dest);
+
+    monitor.connect(ctx.destination);
 
     const rec = new MediaRecorder(dest.stream);
     rec.ondataavailable = (ev) => {
       if (ev.data?.size) setRecURL(URL.createObjectURL(ev.data));
     };
 
-    audioRef.current = { ctx, src, gain, dry, wet, convolver, dest, rec };
+    audioRef.current = { ctx, src, gain, dry, wet, convolver, dest, rec, monitor };
 
     await ctx.resume();
     src.start();
@@ -70,17 +80,14 @@ export default function App() {
       const a = audioRef.current;
       if (!a?.src) return;
 
-      // pitch only
       const rate = Math.pow(2, pitchSt / 12);
       a.src.playbackRate.value = rate;
 
-      setStatus(`pitch ${pitchSt.toFixed(1)} st`);
+      setStatus(`pitch ${pitchSt.toFixed(1)} st ${muted ? "(muted)" : ""}`);
     }).then((s) => (stop = s));
 
     return () => stop?.();
-  }, [ready]);
-
-
+  }, [ready, muted]);
 
   const startRec = useCallback(() => {
     const a = audioRef.current;
@@ -93,6 +100,14 @@ export default function App() {
     if (!a?.rec) return;
     try { a.rec.stop(); } catch { }
   }, []);
+
+  const toggleMute = useCallback(() => {
+    const a = audioRef.current;
+    if (!a?.monitor) return;
+    const next = !muted;
+    a.monitor.gain.value = next ? 0 : 1;
+    setMuted(next);
+  }, [muted]);
 
   return (
     <div style={{
@@ -118,19 +133,10 @@ export default function App() {
 
       <div style={{ height: 12 }} />
       <div style={{ display: "flex", gap: 12 }}>
-        <button
-          onClick={startRec}
-          disabled={!ready}
-          style={btn}
-        >
-          Start REC
-        </button>
-        <button
-          onClick={stopRec}
-          disabled={!ready}
-          style={btn}
-        >
-          Stop REC
+        <button onClick={startRec} disabled={!ready} style={btn}>Start REC</button>
+        <button onClick={stopRec} disabled={!ready} style={btn}>Stop REC</button>
+        <button onClick={toggleMute} disabled={!ready} style={btn}>
+          {muted ? "Unmute" : "Mute"}
         </button>
       </div>
 
@@ -142,7 +148,14 @@ export default function App() {
       {recURL && (
         <>
           <h3>Recording</h3>
-          <audio controls src={recURL} />
+          <audio
+            controls
+            src={recURL}
+            onPlay={() => {
+              const a = audioRef.current;
+              if (a?.monitor) { a.monitor.gain.value = 0; setMuted(true); }
+            }}
+          />
           <div><a href={recURL} download="take.webm" style={{ color: "#0af" }}>download</a></div>
         </>
       )}
