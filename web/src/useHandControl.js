@@ -36,11 +36,31 @@ export async function startHandControl(videoEl, onUpdate) {
 
     const CALIB_MS = 1500;
     const MAX_ST = 6;
+    const VOL_MIN = 0.05;
     const ALPHA = 0.25;
 
     let t0 = performance.now();
     let dMin = Infinity, dMax = 0;
-    let pitchSm = 0;
+    let pitchSm = 0, volSm = 1;
+
+    let mode = "pitch";
+    let lastToggleTs = 0;
+    let highFiveFrames = 0;
+    const TOGGLE_COOLDOWN_MS = 800;
+    const TOGGLE_HOLD_FRAMES = 8;
+
+    const isFingerExtended = (lm, tip, pip, mcp) => lm[tip].y < lm[pip].y && lm[pip].y < lm[mcp].y;
+    const isHighFive = (lm, W) => {
+        const ext =
+            (isFingerExtended(lm, 8, 6, 5) ? 1 : 0) +
+            (isFingerExtended(lm, 12, 10, 9) ? 1 : 0) +
+            (isFingerExtended(lm, 16, 14, 13) ? 1 : 0) +
+            (isFingerExtended(lm, 20, 18, 17) ? 1 : 0);
+        if (ext < 3) return false;
+        const dx = (lm[8].x - lm[20].x) * W;
+        const dy = (lm[8].y - lm[20].y) * W;
+        return Math.hypot(dx, dy) > W * 0.25;
+    };
 
     let rafId = 0;
     const tick = () => {
@@ -58,7 +78,7 @@ export async function startHandControl(videoEl, onUpdate) {
         ctx.drawImage(videoEl, 0, 0, W, H);
 
         if (!res?.landmarks?.length) {
-            onUpdate?.({ pitchSt: pitchSm, dbg: { hasHand: false } });
+            onUpdate?.({ pitchSt: pitchSm, volume: volSm, mode, dbg: { hasHand: false } });
             return;
         }
 
@@ -91,17 +111,37 @@ export async function startHandControl(videoEl, onUpdate) {
         const n = Math.max(0, Math.min(1, (dist - dMin) / rng));
 
         const rawPitch = (0.5 - n) * 2 * MAX_ST;
-        pitchSm = (1 - ALPHA) * pitchSm + ALPHA * rawPitch;
+        const rawVol = Math.max(VOL_MIN, n);
+
+        if (isHighFive(lm, W)) {
+            highFiveFrames++;
+            if (highFiveFrames >= TOGGLE_HOLD_FRAMES && now - lastToggleTs > TOGGLE_COOLDOWN_MS) {
+                mode = mode === "pitch" ? "volume" : "pitch";
+                lastToggleTs = now;
+            }
+        } else {
+            highFiveFrames = 0;
+        }
+
+        if (mode === "pitch") {
+            pitchSm = (1 - ALPHA) * pitchSm + ALPHA * rawPitch;
+        } else {
+            volSm = (1 - ALPHA) * volSm + ALPHA * rawVol;
+        }
 
         ctx.fillStyle = "rgba(0,0,0,0.5)";
-        ctx.fillRect(8, H - 48, 170, 40);
+        ctx.fillRect(8, H - 70, 220, 60);
         ctx.fillStyle = "#fff";
         ctx.font = "16px system-ui, sans-serif";
-        ctx.fillText(`pitch: ${pitchSm.toFixed(1)} st`, 16, H - 20);
+        ctx.fillText(`mode: ${mode}`, 16, H - 48);
+        ctx.fillText(`pitch: ${pitchSm.toFixed(1)} st`, 16, H - 28);
+        ctx.fillText(`vol:   ${(volSm * 100).toFixed(0)}%`, 16, H - 10);
 
         onUpdate?.({
             pitchSt: pitchSm,
-            dbg: { hasHand: true, n, dist, dMin, dMax },
+            volume: volSm,
+            mode,
+            dbg: { hasHand: true, n, dist, dMin, dMax, mode, highFiveFrames },
         });
     };
     tick();

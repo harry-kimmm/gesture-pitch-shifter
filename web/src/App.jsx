@@ -24,6 +24,8 @@ export default function App() {
   async function handleFile(e) {
     if (!e.target.files.length) return;
 
+    try { audioRef.current?.src?.stop(); audioRef.current?.ctx?.close(); } catch { }
+
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
     const arrBuf = await e.target.files[0].arrayBuffer();
     const buf = await ctx.decodeAudioData(arrBuf);
@@ -61,7 +63,10 @@ export default function App() {
 
     const rec = new MediaRecorder(dest.stream);
     rec.ondataavailable = (ev) => {
-      if (ev.data?.size) setRecURL(URL.createObjectURL(ev.data));
+      if (ev.data?.size) setRecURL((old) => {
+        if (old) URL.revokeObjectURL(old);
+        return URL.createObjectURL(ev.data);
+      });
     };
 
     audioRef.current = { ctx, src, gain, dry, wet, convolver, dest, rec, monitor };
@@ -76,23 +81,27 @@ export default function App() {
     if (!ready || !videoRef.current) return;
     let stop = null;
 
-    startHandControl(videoRef.current, ({ pitchSt }) => {
+    startHandControl(videoRef.current, ({ pitchSt, volume, mode }) => {
       const a = audioRef.current;
       if (!a?.src) return;
 
-      const rate = Math.pow(2, pitchSt / 12);
-      a.src.playbackRate.value = rate;
+      a.src.playbackRate.value = Math.pow(2, pitchSt / 12);
 
-      setStatus(`pitch ${pitchSt.toFixed(1)} st ${muted ? "(muted)" : ""}`);
+      a.gain.gain.value = volume;
+
+      const mutedFlag = a?.monitor?.gain.value === 0;
+      setStatus(
+        `mode ${mode} | pitch ${pitchSt.toFixed(1)} st | vol ${(volume * 100).toFixed(0)}% ${mutedFlag ? "(muted)" : ""}`
+      );
     }).then((s) => (stop = s));
 
     return () => stop?.();
-  }, [ready, muted]);
+  }, [ready]);
 
   const startRec = useCallback(() => {
     const a = audioRef.current;
     if (!a?.rec) return;
-    setRecURL(null);
+    setRecURL((old) => { if (old) URL.revokeObjectURL(old); return null; });
     a.rec.start();
   }, []);
   const stopRec = useCallback(() => {
@@ -104,10 +113,10 @@ export default function App() {
   const toggleMute = useCallback(() => {
     const a = audioRef.current;
     if (!a?.monitor) return;
-    const next = !muted;
-    a.monitor.gain.value = next ? 0 : 1;
-    setMuted(next);
-  }, [muted]);
+    const next = a.monitor.gain.value === 0 ? 1 : 0;
+    a.monitor.gain.value = next;
+    setMuted(next === 0);
+  }, []);
 
   return (
     <div style={{
@@ -132,7 +141,7 @@ export default function App() {
       </div>
 
       <div style={{ height: 12 }} />
-      <div style={{ display: "flex", gap: 12 }}>
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
         <button onClick={startRec} disabled={!ready} style={btn}>Start REC</button>
         <button onClick={stopRec} disabled={!ready} style={btn}>Stop REC</button>
         <button onClick={toggleMute} disabled={!ready} style={btn}>
