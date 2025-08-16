@@ -1,106 +1,160 @@
-import { useRef, useState, useEffect, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { startHandControl } from "./useHandControl";
 
 export default function App() {
   const videoRef = useRef(null);
-  const engine = useRef(null);
-  const recRef = useRef(null);
-  const playRef = useRef(null);
+
+  const audioRef = useRef({
+    ctx: null,
+    src: null,
+    gain: null,
+    dry: null,
+    wet: null,
+    convolver: null,
+    dest: null,
+    rec: null,
+  });
 
   const [ready, setReady] = useState(false);
   const [recURL, setRecURL] = useState(null);
+  const [status, setStatus] = useState("load an audio file");
 
-  function buildGraph(audioBuffer) {
-    if (engine.current) {
-      engine.current.src?.stop();
-      engine.current.ctx.close();
-    }
+  async function handleFile(e) {
+    if (!e.target.files.length) return;
 
     const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const src = ctx.createBufferSource(); src.buffer = audioBuffer; src.loop = true;
-    const vol = ctx.createGain(); vol.gain.value = 1;
-    const dry = ctx.createGain(); dry.gain.value = 1;
-    const wet = ctx.createGain(); wet.gain.value = 0;
-    const del = ctx.createDelay(); del.delayTime.value = 0.03;
-    const fb = ctx.createGain(); fb.gain.value = 0.7;
+    const arrBuf = await e.target.files[0].arrayBuffer();
+    const buf = await ctx.decodeAudioData(arrBuf);
 
-    src.connect(vol).connect(dry).connect(ctx.destination);
-    dry.connect(wet).connect(del).connect(fb).connect(wet);
-    wet.connect(ctx.destination);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.loop = true;
+
+    const gain = ctx.createGain(); gain.gain.value = 1;
+
+    const convolver = ctx.createConvolver();
+    convolver.normalize = true;
+    const wet = ctx.createGain(); wet.gain.value = 0.0;
+    const dry = ctx.createGain(); dry.gain.value = 1.0;
 
     const dest = ctx.createMediaStreamDestination();
-    dry.connect(dest); wet.connect(dest);
-    recRef.current = new MediaRecorder(dest.stream);
-    recRef.current.ondataavailable = e => setRecURL(URL.createObjectURL(e.data));
 
-    engine.current = { ctx, src, vol, dry, wet };
-    ctx.resume().then(() => src.start());
+    src.connect(gain);
+    gain.connect(dry);
+    dry.connect(ctx.destination);
+    dry.connect(dest);
+
+    gain.connect(wet);
+    wet.connect(convolver);
+    convolver.connect(ctx.destination);
+    convolver.connect(dest);
+
+    const rec = new MediaRecorder(dest.stream);
+    rec.ondataavailable = (ev) => {
+      if (ev.data?.size) setRecURL(URL.createObjectURL(ev.data));
+    };
+
+    audioRef.current = { ctx, src, gain, dry, wet, convolver, dest, rec };
+
+    await ctx.resume();
+    src.start();
     setReady(true);
-  }
-
-  /* ── file input handler ─────────────────────────────── */
-  async function handleFile(e) {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const arr = await file.arrayBuffer();
-    const buf = await new AudioContext().decodeAudioData(arr);
-    setRecURL(null);                               // clear old recording
-    buildGraph(buf);
-  }
-
-  /* ── mute / resume loop during playback of take ─────── */
-  function stopLoop() { engine.current?.src?.stop(); engine.current.src = null; }
-  function resumeLoop() {
-    if (engine.current && !engine.current.src) {
-      const { ctx, vol } = engine.current;
-      const src = ctx.createBufferSource();
-      src.buffer = engine.current.vol.context.createBufferSource().buffer;
-      src.buffer = engine.current.dry.context.createBufferSource().buffer;
-      src.buffer = engine.current.wet.context.createBufferSource().buffer;
-      src.buffer = engine.current.dry.context.createBufferSource().buffer;
-    }
+    setStatus("playing");
   }
 
   useEffect(() => {
-    if (!recURL) return;
-    const p = playRef.current;
-    p.onplay = stopLoop;
-    p.onended = resumeLoop;
-    return () => { p.onplay = p.onended = null; };
-  }, [recURL]);
+    if (!ready || !videoRef.current) return;
+    let stop = null;
 
-  const onCtrl = useCallback(({ mode, pitch, vol, rev }) => {
-    const g = engine.current;
-    if (!g?.src) return;
-    if (mode === 0) { g.src.playbackRate.value = 2 ** (pitch / 12); g.vol.gain.value = 1; g.dry.gain.value = 1; g.wet.gain.value = 0; }
-    if (mode === 1) { g.src.playbackRate.value = 1; g.vol.gain.value = vol; g.dry.gain.value = 1; g.wet.gain.value = 0; }
-    if (mode === 2) { g.src.playbackRate.value = 1; g.vol.gain.value = 1; g.dry.gain.value = 1 - rev; g.wet.gain.value = rev; }
+    startHandControl(videoRef.current, ({ pitchSt }) => {
+      const a = audioRef.current;
+      if (!a?.src) return;
+
+      // pitch only
+      const rate = Math.pow(2, pitchSt / 12);
+      a.src.playbackRate.value = rate;
+
+      setStatus(`pitch ${pitchSt.toFixed(1)} st`);
+    }).then((s) => (stop = s));
+
+    return () => stop?.();
+  }, [ready]);
+
+
+
+  const startRec = useCallback(() => {
+    const a = audioRef.current;
+    if (!a?.rec) return;
+    setRecURL(null);
+    a.rec.start();
+  }, []);
+  const stopRec = useCallback(() => {
+    const a = audioRef.current;
+    if (!a?.rec) return;
+    try { a.rec.stop(); } catch { }
   }, []);
 
-  useEffect(() => {
-    if (ready) return startHandControl(videoRef.current, onCtrl);
-  }, [ready, onCtrl]);
-
   return (
-    <div style={{ padding: 20, minHeight: "100vh", background: "#222", color: "#eee", fontFamily: "sans-serif" }}>
+    <div style={{
+      padding: 16, minHeight: "100vh", color: "#eee",
+      background: "#1f1f1f", fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
+    }}>
       <input type="file" accept="audio/*" onChange={handleFile} />
-      <br /><br />
-      <video ref={videoRef} width="320" autoPlay muted style={{ borderRadius: 8 }} />
-      {ready && (
-        <>
-          <br />
-          <button onClick={() => recRef.current.start()}>Start REC</button>
-          <button onClick={() => recRef.current.stop()} style={{ marginLeft: 10 }}>Stop REC</button>
-        </>
-      )}
+      <div style={{ height: 12 }} />
+      <div style={{ position: "relative", width: 640, maxWidth: "95vw" }}>
+        <video
+          ref={videoRef}
+          autoPlay
+          muted
+          playsInline
+          style={{
+            width: "100%",
+            borderRadius: 12,
+            display: "block",
+            filter: "contrast(1.05) saturate(1.05)"
+          }}
+        />
+      </div>
+
+      <div style={{ height: 12 }} />
+      <div style={{ display: "flex", gap: 12 }}>
+        <button
+          onClick={startRec}
+          disabled={!ready}
+          style={btn}
+        >
+          Start REC
+        </button>
+        <button
+          onClick={stopRec}
+          disabled={!ready}
+          style={btn}
+        >
+          Stop REC
+        </button>
+      </div>
+
+      <div style={{ height: 16 }} />
+      <div style={{ opacity: ready ? 1 : 0.6 }}>
+        <strong>Status:</strong> {status}
+      </div>
+
       {recURL && (
         <>
           <h3>Recording</h3>
-          <audio ref={playRef} controls src={recURL} />
-          <br />
-          <a href={recURL} download="take.webm" style={{ color: "#0af" }}>download</a>
+          <audio controls src={recURL} />
+          <div><a href={recURL} download="take.webm" style={{ color: "#0af" }}>download</a></div>
         </>
       )}
     </div>
   );
 }
+
+const btn = {
+  padding: "10px 16px",
+  background: "#2b2b2b",
+  color: "#fff",
+  border: "1px solid #444",
+  borderRadius: 10,
+  cursor: "pointer",
+};
